@@ -15,11 +15,14 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize Session State for decision tracking
+# Initialize Session State
 if 'decision' not in st.session_state:
-    st.session_state.decision = None # Can be 'Accepted', 'Declined', or None
+    st.session_state.decision = None
 if 'decision_time' not in st.session_state:
     st.session_state.decision_time = None
+if 'start_time' not in st.session_state:
+    # Simulate an offer coming in 3 hours ago
+    st.session_state.start_time = datetime.now() - timedelta(hours=3, minutes=12)
 
 # -----------------------------------------------------------------------------
 # 2. HELPER FUNCTIONS & CALCULATIONS
@@ -37,7 +40,7 @@ def calculate_kdri_kdpi(age, height_cm, weight_kg, ethnicity, hypertension,
         height_m = height_cm / 100.0
         weight_kg = float(weight_kg)
         
-        # KDRI Coefficients (Simplified for hackathon demonstration)
+        # KDRI Coefficients (Simplified for hackathon demo)
         # Reference: Age 40, White, No HTN/DM, Creatinine 1.0
         
         # Age Factor
@@ -48,7 +51,13 @@ def calculate_kdri_kdpi(age, height_cm, weight_kg, ethnicity, hypertension,
         else:
             x_age = 0 # Baseline
 
-        x_eth = 0.179 if ethnicity == "Black/African American" else 0
+        # Ethnicity Factor (Removed in 2024 update, but kept as 0 for legacy logic if needed)
+        x_eth = 0 
+        if ethnicity == "Black/African American":
+            # NOTE: OPTN removed race coefficient in 2024. 
+            # We keep variable for UI but set coefficient to 0 or very low for demo accuracy.
+            x_eth = 0.0 
+
         x_htn = 0.126 if hypertension else 0
         x_dm = 0.130 if diabetes else 0
         x_cva = 0.088 if cause_of_death == "CVA (Stroke)" else 0
@@ -73,21 +82,48 @@ def calculate_kdri_kdpi(age, height_cm, weight_kg, ethnicity, hypertension,
         return round(kdri_raw, 2), round(kdpi_pred, 1)
 
     except Exception as e:
-        st.error(f"Error calculating KDPI: {e}")
         return 0.0, 0.0
 
-def generate_perfusion_data():
+def calculate_viability_window(kdpi, fmn_level, resistance, tubular_injury_score):
+    """
+    Calculates how much time is LEFT before the organ is non-viable.
+    Base Rule: A perfect kidney lasts 30 hours on pump.
+    Penalties: High KDPI, High FMN, High Resistance reduce this window.
+    """
+    base_window_hours = 30.0 # Maximum theoretical limit on pump
+    
+    # Penalty 1: KDPI (Age/History)
+    # A 99% KDPI kidney loses 12 hours of viability window immediately
+    kdpi_penalty = (kdpi / 100.0) * 12.0
+    
+    # Penalty 2: Current FMN Level (Metabolic Distress)
+    # FMN > 300 is bad.
+    fmn_penalty = 0
+    if fmn_level > 300:
+        fmn_penalty = (fmn_level - 300) / 100.0 # lose 1 hour for every 100 units over 300
+        
+    # Penalty 3: Vascular Resistance
+    # Resistance > 0.4 is bad
+    res_penalty = 0
+    if resistance > 0.4:
+        res_penalty = (resistance - 0.4) * 10 # significant penalty for resistance
+        
+    # Penalty 4: Biopsy Score (TIS)
+    tis_penalty = tubular_injury_score * 0.5 # 0.5 hours lost per point
+    
+    total_viability_hours = base_window_hours - kdpi_penalty - fmn_penalty - res_penalty - tis_penalty
+    
+    # Ensure min of 2 hours for UI stability
+    return max(2.0, total_viability_hours)
+
+def generate_perfusion_data(hours_simulated=4):
     """Generates synthetic time-series data for machine perfusion (BioHack feature)"""
-    # Simulate 4 hours of transport data
-    hours = np.linspace(0, 4, 40)
+    hours = np.linspace(0, hours_simulated, 40)
     
     # FMN (Flavin Mononucleotide) - Biomarker of mitochondrial damage
-    # Healthy kidney: FMN washes out (decreases)
-    # Damaged kidney: FMN stays high or rises
     fmn = 800 * np.exp(-0.8 * hours) + 150 + np.random.normal(0, 15, 40)
     
     # Renal Resistance - Measure of vascular health
-    # Healthy: Low and stable (0.2 - 0.4)
     resistance = 0.5 - 0.2 * (1 - np.exp(-hours)) + np.random.normal(0, 0.01, 40)
     
     return pd.DataFrame({
@@ -97,14 +133,17 @@ def generate_perfusion_data():
     })
 
 # -----------------------------------------------------------------------------
-# 3. SIDEBAR: DATA INPUTS
+# 3. SIDEBAR: DATA INPUTS (REACTIVE)
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/e/ee/Kidney_cross_section.jpg/640px-Kidney_cross_section.jpg", use_column_width=True)
     st.header("1. Donor Demographics")
-    st.caption("Inputs for KDPI Algorithm")
+    st.caption("Change these to see KDPI update instantly:")
     
-    d_age = st.number_input("Age", 0, 100, 48)
+    # Key inputs that drive KDPI
+    d_age = st.slider("Age", 0, 90, 48)
+    d_creat = st.slider("Creatinine (mg/dL)", 0.5, 8.0, 1.1, step=0.1)
+    
     col1, col2 = st.columns(2)
     with col1:
         d_hgt = st.number_input("Height (cm)", 50, 250, 175)
@@ -119,13 +158,18 @@ with st.sidebar:
     d_dm = st.checkbox("Diabetes", value=False)
     d_hcv = st.selectbox("HCV Status", ["Negative", "Positive"])
     d_dcd = st.checkbox("DCD (Donation after Circulatory Death)")
-    d_creat = st.number_input("Terminal Creatinine (mg/dL)", 0.1, 15.0, 1.1, step=0.1)
 
     st.divider()
     
     st.header("2. BioHack Advanced Tools")
     run_ai_analysis = st.toggle("Enable AI Biopsy Analysis", value=True)
     connect_pump = st.toggle("Connect to Perfusion Pump", value=True)
+    
+    # Hidden Inputs for simulation logic
+    # In a real app, these would come from the CSV/API
+    sim_fmn = 350 # Simulated current FMN reading
+    sim_res = 0.38 # Simulated current Resistance
+    sim_tis = 4 # Simulated Tubular Injury Score
 
 # -----------------------------------------------------------------------------
 # 4. MAIN DASHBOARD LOGIC
@@ -134,16 +178,46 @@ with st.sidebar:
 # --- HEADER SECTION: DECISION TIMER & SCORE ---
 col_head1, col_head2, col_head3 = st.columns([2, 1, 1])
 
-# Calculate KDPI live
+# Calculate KDPI live based on sidebar inputs
 kdri_val, kdpi_val = calculate_kdri_kdpi(d_age, d_hgt, d_wgt, d_eth, d_htn, d_dm, d_cod, d_creat, d_hcv, d_dcd)
+
+# Calculate Dynamic Time Remaining
+total_viability_window = calculate_viability_window(kdpi_val, sim_fmn, sim_res, sim_tis)
+elapsed_time = (datetime.now() - st.session_state.start_time).total_seconds() / 3600
+time_left_hours = total_viability_window - elapsed_time
+
+# Formatting Time Left
+if time_left_hours <= 0:
+    time_display = "EXPIRED"
+    time_color = "#000000"
+    time_delta_color = "off"
+elif time_left_hours < 2:
+    time_display = f"{int(time_left_hours)}h {int((time_left_hours%1)*60)}m"
+    time_color = "#dc3545" # Red - CRITICAL
+    time_delta_color = "inverse"
+elif time_left_hours < 6:
+    time_display = f"{int(time_left_hours)}h {int((time_left_hours%1)*60)}m"
+    time_color = "#ffc107" # Yellow - Warning
+    time_delta_color = "normal"
+else:
+    time_display = f"{int(time_left_hours)}h {int((time_left_hours%1)*60)}m"
+    time_color = "#28a745" # Green - Safe
+    time_delta_color = "normal"
+
 
 with col_head1:
     st.title("Kidney Viability Command Dashboard")
     st.caption(f"Offer ID: #UNOS-{int(time.time())} | Center: OSU Wexner Medical Center")
 
 with col_head2:
-    # Simulated Cold Ischemia Time
-    st.metric("Cold Ischemia Time", "04h 12m", delta="-12m (Critical)", delta_color="inverse")
+    # THE NEW DYNAMIC COUNTER
+    st.markdown(f"""
+        <div style="text-align:center; border: 2px solid {time_color}; border-radius: 10px; padding: 5px; background-color: #f8f9fa;">
+            <div style="font-size:12px; font-weight:bold; color:gray;">VIABILITY WINDOW REMAINING</div>
+            <div style="font-size:32px; font-weight:bold; color:{time_color};">{time_display}</div>
+            <div style="font-size:10px;">Based on KDPI {int(kdpi_val)}% & Perfusion Data</div>
+        </div>
+    """, unsafe_allow_html=True)
 
 with col_head3:
     # Traffic Light Logic based on KDPI
